@@ -41,6 +41,12 @@ app.use("/api/v1",Favourite);
 app.use("/api/v1",Cart);
 app.use("/api/v1",Order);
 app.use("/api/v1",AI);
+
+// Root route
+app.get("/", (req, res) => {
+    res.send("BookVerse API is running successfully!");
+});
+
 //creating port
 app.listen(process.env.PORT, () => {
     console.log(`Server is running on port ${process.env.PORT}`);
