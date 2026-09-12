@@ -9,6 +9,7 @@ const Books = require("./routes/book");
 const Favourite = require("./routes/favourite");
 const Cart = require("./routes/cart");
 const Order = require("./routes/order");
+const AI = require("./routes/ai");
 
 const allowedOrigins = [
     "https://book-store-5v8f.onrender.com", // Render backend (self, optional)
@@ -39,6 +40,7 @@ app.use( "/api/v1",Books);
 app.use("/api/v1",Favourite);
 app.use("/api/v1",Cart);
 app.use("/api/v1",Order);
+app.use("/api/v1",AI);
 //creating port
 app.listen(process.env.PORT, () => {
     console.log(`Server is running on port ${process.env.PORT}`);

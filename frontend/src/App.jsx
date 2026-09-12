@@ -21,6 +21,9 @@ import Settings from "./components/Profile/Settings";
 import AllOrders from "./components/Profile/AllOrders";
 import AddBook from "./components/Profile/AddBook";
 
+// AI Chatbot
+import Chatbot from "./components/Chatbot/Chatbot";
+
 const App = () => {
   const dispatch = useDispatch();
   const role = useSelector((state) => state.auth.role);
@@ -59,6 +62,7 @@ const App = () => {
         <Route path="/Signup" element={<Signup />} />
         <Route path="/view-book-details/:id" element={<ViewBookDetails />} />
       </Routes>
+      <Chatbot />
       <Footer />
     </div>
   );
