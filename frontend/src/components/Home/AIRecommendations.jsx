@@ -19,22 +19,41 @@ const AIRecommendations = () => {
       const payload = {};
       if (userPrefs) payload.preferences = userPrefs;
 
-      // If logged in, try to send favourite IDs
+      // If logged in, gather full user context: favourites, cart, and orders
       if (isLoggedIn) {
-        try {
-          const headers = {
-            id: localStorage.getItem("id"),
-            authorization: `Bearer ${localStorage.getItem("token")}`,
-          };
-          const userRes = await axios.get(
-            `${BASE_URL}/get-user-information`,
-            { headers }
-          );
-          if (userRes.data?.favourites?.length > 0) {
-            payload.favouriteIds = userRes.data.favourites;
-          }
-        } catch {
-          // Silently fail — proceed without favourites
+        const headers = {
+          id: localStorage.getItem("id"),
+          authorization: `Bearer ${localStorage.getItem("token")}`,
+        };
+
+        // Fetch all user data in parallel
+        const requests = [
+          axios.get(`${BASE_URL}/get-user-information`, { headers }).catch(() => null),
+          axios.get(`${BASE_URL}/get-user-cart`, { headers }).catch(() => null),
+          axios.get(`${BASE_URL}/get-order-history`, { headers }).catch(() => null),
+        ];
+
+        const [userRes, cartRes, orderRes] = await Promise.all(requests);
+
+        // Favourites
+        if (userRes?.data?.favourites?.length > 0) {
+          payload.favouriteIds = userRes.data.favourites;
+        }
+
+        // Cart items — extract book IDs
+        if (cartRes?.data?.data?.length > 0) {
+          payload.cartIds = cartRes.data.data
+            .map((item) => item.book?._id || item.book)
+            .filter(Boolean);
+        }
+
+        // Order history — extract unique book IDs
+        if (orderRes?.data?.data?.length > 0) {
+          const orderedIds = orderRes.data.data
+            .map((order) => order.book?._id || order.book)
+            .filter(Boolean);
+          // Deduplicate
+          payload.orderedBookIds = [...new Set(orderedIds.map(String))];
         }
       }
 

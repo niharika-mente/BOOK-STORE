@@ -1,5 +1,6 @@
 const router = require("express").Router();
 const Book = require("../models/book");
+const Order = require("../models/order");
 const model = require("../connections/gemini");
 
 // Build the book catalog context string for Gemini
@@ -18,6 +19,59 @@ function formatCatalog(books) {
         `ID:${b._id} | "${b.title}" by ${b.author} | ₹${b.price} | ${b.language} | ${b.desc?.substring(0, 120) || "No description"}`
     )
     .join("\n");
+}
+
+// Robust JSON extraction from Gemini responses
+function parseAIResponse(responseText) {
+  // Try direct parse first
+  try {
+    return JSON.parse(responseText.trim());
+  } catch {
+    // ignore
+  }
+
+  // Strip markdown code fences
+  try {
+    const cleaned = responseText
+      .replace(/^```(?:json)?\s*/i, "")
+      .replace(/```\s*$/i, "")
+      .trim();
+    return JSON.parse(cleaned);
+  } catch {
+    // ignore
+  }
+
+  // Try to extract JSON object from the response using regex
+  try {
+    const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      return JSON.parse(jsonMatch[0]);
+    }
+  } catch {
+    // ignore
+  }
+
+  return null;
+}
+
+// Helper: run Gemini with a timeout
+async function generateWithTimeout(generatable, timeoutMs = 15000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    let result;
+    if (typeof generatable.sendMessage === "function") {
+      // It's a chat object — caller should use sendMessageWithTimeout instead
+      throw new Error("Use sendMessageWithTimeout for chat objects");
+    }
+    result = await model.generateContent(generatable);
+    clearTimeout(timer);
+    return result;
+  } catch (err) {
+    clearTimeout(timer);
+    throw err;
+  }
 }
 
 // ──────────────────────────────────────────────
@@ -52,11 +106,12 @@ RULES:
 2. Reference books by their exact MongoDB _id from the catalog.
 3. Be warm and concise — keep "text" to 2-3 sentences MAX.
 4. If asked about non-book topics, politely redirect to books.
+5. You MUST respond with ONLY a valid JSON object, no markdown, no extra text.
 
 CATALOG:
 ${catalogStr}
 
-You MUST respond with this exact JSON structure:
+Respond with this exact JSON structure (no markdown code fences, no extra text):
 {"text": "Brief response (2-3 sentences)", "recommendedBookIds": ["id1", "id2"], "followUp": "A short follow-up question"}
 
 - recommendedBookIds: array of MongoDB _id strings from the catalog (max 4). Empty array if no recommendation needed.
@@ -96,25 +151,26 @@ You MUST respond with this exact JSON structure:
       ],
     });
 
-    const result = await chat.sendMessage(message);
+    // Send message with timeout
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("Gemini request timed out")), 15000)
+    );
+    const result = await Promise.race([
+      chat.sendMessage(message),
+      timeoutPromise,
+    ]);
     const responseText = result.response.text().trim();
 
     // Parse the JSON response from Gemini
-    let parsed;
-    try {
-      // Strip markdown code fences if Gemini adds them
-      const cleaned = responseText
-        .replace(/^```json?\s*/i, "")
-        .replace(/```\s*$/i, "")
-        .trim();
-      parsed = JSON.parse(cleaned);
-    } catch {
-      // If parsing fails, treat the whole response as text
-      parsed = {
-        text: responseText,
-        recommendedBookIds: [],
+    const parsed = parseAIResponse(responseText);
+
+    if (!parsed) {
+      // If all parsing attempts fail, use the raw text as the reply
+      return res.status(200).json({
+        reply: responseText.substring(0, 500),
+        books: [],
         followUp: null,
-      };
+      });
     }
 
     // Enrich recommended books with full data
@@ -150,7 +206,7 @@ You MUST respond with this exact JSON structure:
 // ──────────────────────────────────────────────────
 router.post("/ai/recommendations", async (req, res) => {
   try {
-    const { preferences, favouriteIds } = req.body;
+    const { preferences, favouriteIds, cartIds, orderedBookIds } = req.body;
 
     const catalog = await getCatalogContext();
 
@@ -165,18 +221,52 @@ router.post("/ai/recommendations", async (req, res) => {
 
     const catalogStr = formatCatalog(catalog);
 
-    // Build user context
+    // Build rich user context from all available data
     let userContext = "";
+    const excludeIds = new Set();
+
+    // Favourites context
     if (favouriteIds && favouriteIds.length > 0) {
       const favBooks = await Book.find({ _id: { $in: favouriteIds } })
         .select("title author language")
         .lean();
       if (favBooks.length > 0) {
-        userContext = `\nUser's favourite books: ${favBooks.map((b) => `"${b.title}" by ${b.author} (${b.language})`).join(", ")}`;
+        userContext += `\nUser's FAVOURITE books (they love these): ${favBooks.map((b) => `"${b.title}" by ${b.author} (${b.language})`).join(", ")}`;
+        favouriteIds.forEach((id) => excludeIds.add(id.toString()));
       }
     }
+
+    // Cart context
+    if (cartIds && cartIds.length > 0) {
+      const cartBooks = await Book.find({ _id: { $in: cartIds } })
+        .select("title author language")
+        .lean();
+      if (cartBooks.length > 0) {
+        userContext += `\nUser's CART (they intend to buy these): ${cartBooks.map((b) => `"${b.title}" by ${b.author} (${b.language})`).join(", ")}`;
+        cartIds.forEach((id) => excludeIds.add(id.toString()));
+      }
+    }
+
+    // Order history context
+    if (orderedBookIds && orderedBookIds.length > 0) {
+      const orderedBooks = await Book.find({ _id: { $in: orderedBookIds } })
+        .select("title author language")
+        .lean();
+      if (orderedBooks.length > 0) {
+        userContext += `\nUser's PREVIOUSLY ORDERED books (already purchased): ${orderedBooks.map((b) => `"${b.title}" by ${b.author} (${b.language})`).join(", ")}`;
+        orderedBookIds.forEach((id) => excludeIds.add(id.toString()));
+      }
+    }
+
+    // User preferences text
     if (preferences) {
       userContext += `\nUser's stated preferences: "${preferences}"`;
+    }
+
+    // Build exclude instruction
+    let excludeInstruction = "";
+    if (excludeIds.size > 0) {
+      excludeInstruction = `\n\nIMPORTANT: Do NOT recommend any of these book IDs (the user already has them): ${[...excludeIds].join(", ")}`;
     }
 
     const prompt = `You are a book recommendation engine for BookVerse store.
@@ -184,60 +274,73 @@ router.post("/ai/recommendations", async (req, res) => {
 CATALOG:
 ${catalogStr}
 ${userContext || "\nNo specific user preferences available — recommend broadly appealing popular books."}
+${excludeInstruction}
 
-Pick the best 4 books to recommend from the catalog. Respond with valid JSON only (no markdown fences):
+Pick the best 4 books to recommend from the catalog that the user does NOT already have. Choose books that complement their taste based on their favourites, cart, and order history. Recommend DIFFERENT books from what they already own.
+
+Respond with ONLY a valid JSON object (no markdown code fences, no extra text):
 {
   "recommendations": [
-    { "bookId": "mongoId", "reason": "Short 1-sentence reason why this book is recommended" }
+    { "bookId": "mongoId", "reason": "Short 1-sentence reason why this book is recommended based on their taste" }
   ]
 }`;
 
-    const result = await model.generateContent(prompt);
+    // Generate with timeout
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("Gemini request timed out")), 15000)
+    );
+    const result = await Promise.race([
+      model.generateContent(prompt),
+      timeoutPromise,
+    ]);
     const responseText = result.response.text().trim();
 
-    let parsed;
-    try {
-      const cleaned = responseText
-        .replace(/^```json?\s*/i, "")
-        .replace(/```\s*$/i, "")
-        .trim();
-      parsed = JSON.parse(cleaned);
-    } catch {
-      // Fallback
-      const fallback = catalog.slice(0, 4).map((b) => ({
-        book: b,
-        reason: "Popular in our store",
-      }));
+    const parsed = parseAIResponse(responseText);
+
+    if (!parsed || !parsed.recommendations || parsed.recommendations.length === 0) {
+      // Fallback: return books NOT in user's collection
+      const fallbackBooks = catalog
+        .filter((b) => !excludeIds.has(b._id.toString()))
+        .slice(0, 4);
+      const fallback = (fallbackBooks.length > 0 ? fallbackBooks : catalog.slice(0, 4))
+        .map((b) => ({
+          book: b,
+          reason: "Popular in our store",
+        }));
       return res.status(200).json({ recommendations: fallback });
     }
 
     // Enrich with full book data
-    if (parsed.recommendations && parsed.recommendations.length > 0) {
-      const ids = parsed.recommendations.map((r) => r.bookId);
-      const books = await Book.find({ _id: { $in: ids } })
-        .select("_id title author price url language")
-        .lean();
+    const ids = parsed.recommendations.map((r) => r.bookId);
+    const books = await Book.find({ _id: { $in: ids } })
+      .select("_id title author price url language")
+      .lean();
 
-      const bookMap = {};
-      books.forEach((b) => {
-        bookMap[b._id.toString()] = b;
-      });
+    const bookMap = {};
+    books.forEach((b) => {
+      bookMap[b._id.toString()] = b;
+    });
 
-      const enriched = parsed.recommendations
-        .filter((r) => bookMap[r.bookId])
-        .map((r) => ({
-          book: bookMap[r.bookId],
-          reason: r.reason,
-        }));
+    const enriched = parsed.recommendations
+      .filter((r) => bookMap[r.bookId])
+      .map((r) => ({
+        book: bookMap[r.bookId],
+        reason: r.reason,
+      }));
 
+    if (enriched.length > 0) {
       return res.status(200).json({ recommendations: enriched });
     }
 
-    // Fallback
-    const fallback = catalog.slice(0, 4).map((b) => ({
-      book: b,
-      reason: "Popular in our store",
-    }));
+    // Fallback if enrichment found nothing
+    const fallbackBooks = catalog
+      .filter((b) => !excludeIds.has(b._id.toString()))
+      .slice(0, 4);
+    const fallback = (fallbackBooks.length > 0 ? fallbackBooks : catalog.slice(0, 4))
+      .map((b) => ({
+        book: b,
+        reason: "Popular in our store",
+      }));
     return res.status(200).json({ recommendations: fallback });
   } catch (error) {
     console.error("AI Recommendations Error:", error.message);
