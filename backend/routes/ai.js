@@ -6,7 +6,7 @@ const model = require("../connections/gemini");
 // Build the book catalog context string for Gemini
 async function getCatalogContext() {
   const books = await Book.find()
-    .select("_id title author price language desc url")
+    .select( "_id title author price language desc url createdAt" )
     .lean();
   return books;
 }
@@ -19,6 +19,89 @@ function formatCatalog(books) {
         `ID:${b._id} | "${b.title}" by ${b.author} | ₹${b.price} | ${b.language} | ${b.desc?.substring(0, 120) || "No description"}`
     )
     .join("\n");
+}
+
+const PREFERENCE_ALIASES = {
+  "science fiction": [ "science", "fiction", "sci-fi", "scifi" ],
+  fantasy: [ "magic", "magical", "adventure" ],
+  romance: [ "romance", "romantic", "love", "relationship" ],
+  thriller: [ "thriller", "suspense", "crime", "mystery" ],
+  mystery: [ "mystery", "detective", "crime", "suspense" ],
+  "self help": [ "self-help", "selfhelp", "habits", "productivity", "motivation" ],
+  adventure: [ "adventure", "journey", "travel", "explore" ],
+  classic: [ "classic", "literature", "novel" ],
+  art: [ "art", "creative", "drawing", "coloring", "mandala" ],
+  hindi: [ "hindi" ],
+  english: [ "english" ],
+};
+
+const PREFERENCE_STOP_WORDS = new Set( [
+  "a", "an", "and", "book", "books", "for", "give", "get", "i", "me",
+  "more", "of", "recommend", "recommendation", "recommendations", "some",
+  "that", "the", "want", "which", "with", "would", "like", "something",
+] );
+
+function getPreferenceTerms ( preferences = "" )
+{
+  const normalized = preferences.toLowerCase().replace( /[₹$]/g, "" );
+  const words = normalized
+    .split( /[^a-z0-9]+/ )
+    .filter( ( word ) => word.length > 2 && !PREFERENCE_STOP_WORDS.has( word ) );
+  const phrases = Object.keys( PREFERENCE_ALIASES ).filter( ( phrase ) =>
+    normalized.includes( phrase )
+  );
+  const aliasTerms = phrases.flatMap( ( phrase ) => PREFERENCE_ALIASES[ phrase ] );
+  return [ ...new Set( [ ...words, ...phrases, ...aliasTerms ] ) ];
+}
+
+function getMaximumPrice ( preferences = "" )
+{
+  const match = preferences.match( /(?:under|below|less than|within)\s*[₹$]?\s*(\d+)/i );
+  return match ? Number( match[ 1 ] ) : null;
+}
+
+function buildFallbackRecommendations ( catalog, excludeIds, preferences = "" )
+{
+  const preferenceTerms = getPreferenceTerms( preferences );
+  const maximumPrice = getMaximumPrice( preferences );
+
+  const recentBookIds = new Set(
+    [ ...catalog ]
+      .sort( ( a, b ) => new Date( b.createdAt || 0 ) - new Date( a.createdAt || 0 ) )
+      .slice( 0, 4 )
+      .map( ( book ) => book._id.toString() )
+  );
+  const olderBooks = catalog.filter(
+    ( book ) =>
+      !excludeIds.has( book._id.toString() ) &&
+      !recentBookIds.has( book._id.toString() )
+  );
+  const availableBooks = ( olderBooks.length >= 4 ? olderBooks : catalog ).filter(
+    ( book ) =>
+      !excludeIds.has( book._id.toString() ) &&
+      ( maximumPrice === null || book.price <= maximumPrice )
+  );
+  const rankedBooks = availableBooks
+    .map( ( book ) =>
+    {
+      const searchableText = `${ book.title } ${ book.author } ${ book.language } ${ book.desc || "" }`.toLowerCase();
+      const preferenceScore = preferenceTerms.reduce(
+        ( score, term ) => score + ( searchableText.includes( term ) ? ( term.includes( " " ) ? 3 : 1 ) : 0 ),
+        0
+      );
+      return { book, preferenceScore };
+    } )
+    .sort( ( a, b ) => b.preferenceScore - a.preferenceScore || Math.random() - 0.5 );
+
+  const selectedBooks = rankedBooks.slice( 0, 4 );
+  return selectedBooks.map( ( { book, preferenceScore } ) => ( {
+    book,
+    reason: maximumPrice !== null && book.price <= maximumPrice
+      ? `A good match within your budget of ₹${ maximumPrice }.`
+      : preferenceScore > 0
+        ? `A good match for your interest in ${ preferences }.`
+        : "A fresh pick from our collection.",
+  } ) );
 }
 
 // Robust JSON extraction from Gemini responses
@@ -146,21 +229,30 @@ router.post("/ai/recommendations", async (req, res) => {
 
     const catalog = await getCatalogContext();
 
-    if (!process.env.GEMINI_API_KEY || catalog.length === 0) {
-      // Fallback: return 4 most recent books
-      const fallback = catalog.slice(0, 4).map((b) => ({
-        book: b,
-        reason: "Popular in our store",
-      }));
-      return res.status(200).json({ recommendations: fallback });
+    const excludeIds = new Set();
+
+    [ favouriteIds, cartIds, orderedBookIds ]
+      .filter( Array.isArray )
+      .flat()
+      .forEach( ( id ) => excludeIds.add( id.toString() ) );
+
+    if ( catalog.length === 0 )
+    {
+      return res.status( 200 ).json( {
+        recommendations: buildFallbackRecommendations( catalog, excludeIds, preferences ),
+      } );
     }
+
+    // Keep recommendations available when Gemini is unavailable or rate-limited.
+    // The local matcher understands natural descriptions and uses the catalog data.
+    return res.status( 200 ).json( {
+      recommendations: buildFallbackRecommendations( catalog, excludeIds, preferences ),
+    } );
 
     const catalogStr = formatCatalog(catalog);
 
     // Build rich user context from all available data
     let userContext = "";
-    const excludeIds = new Set();
-
     // Favourites context
     if (favouriteIds && favouriteIds.length > 0) {
       const favBooks = await Book.find({ _id: { $in: favouriteIds } })
@@ -229,15 +321,9 @@ Respond with ONLY a valid JSON object (no markdown code fences, no extra text):
 
     if (!parsed || !parsed.recommendations || parsed.recommendations.length === 0) {
       // Fallback: return books NOT in user's collection
-      const fallbackBooks = catalog
-        .filter((b) => !excludeIds.has(b._id.toString()))
-        .slice(0, 4);
-      const fallback = (fallbackBooks.length > 0 ? fallbackBooks : catalog.slice(0, 4))
-        .map((b) => ({
-          book: b,
-          reason: "Popular in our store",
-        }));
-      return res.status(200).json({ recommendations: fallback });
+      return res.status( 200 ).json( {
+        recommendations: buildFallbackRecommendations( catalog, excludeIds, preferences ),
+      } );
     }
 
     // Enrich with full book data
@@ -263,28 +349,21 @@ Respond with ONLY a valid JSON object (no markdown code fences, no extra text):
     }
 
     // Fallback if enrichment found nothing
-    const fallbackBooks = catalog
-      .filter((b) => !excludeIds.has(b._id.toString()))
-      .slice(0, 4);
-    const fallback = (fallbackBooks.length > 0 ? fallbackBooks : catalog.slice(0, 4))
-      .map((b) => ({
-        book: b,
-        reason: "Popular in our store",
-      }));
-    return res.status(200).json({ recommendations: fallback });
+    return res.status( 200 ).json( {
+      recommendations: buildFallbackRecommendations( catalog, excludeIds, preferences ),
+    } );
   } catch (error) {
     console.error("AI Recommendations Error:", error.message);
     try {
-      const fallback = await Book.find()
-        .sort({ createdAt: -1 })
-        .limit(4)
-        .select("_id title author price url language")
+      const fallbackCatalog = await Book.find()
+        .select( "_id title author price url language desc createdAt" )
         .lean();
       return res.status(200).json({
-        recommendations: fallback.map((b) => ({
-          book: b,
-          reason: "AI is currently busy — here's a popular pick instead! ✨ (Fallback Mode)",
-        })),
+        recommendations: buildFallbackRecommendations(
+          fallbackCatalog,
+          new Set(),
+          req.body.preferences
+        ),
       });
     } catch {
       return res.status(200).json({ recommendations: [] });
